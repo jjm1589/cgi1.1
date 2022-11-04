@@ -1,103 +1,46 @@
-#include <iostream>
-#include "httpd.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <pthread.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <assert.h>
-#include <dirent.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <dirent.h>
-#include <sys/wait.h>
-#include <netdb.h>
-#include <arpa/inet.h>
-#include <ctype.h>
+#include <iostream> // 提供一个方便的命令行输入输出试验环境
+#include "httpd.h" // 自定义文件引入
+#include <stdio.h> // 标准输入输出库
+#include <stdlib.h> // 这包括有关内存分配的函数
+#include <string.h> // 包含各种字符串函数
+#include <unistd.h> // 相当于windows操作系统的"windows.h"，是操作系统为用户提供的统一API接口
+#include <netinet/in.h> // 包含Internet域地址所需的常量和结构
+#include <sys/socket.h> // 创建socket所需的
+#include <pthread.h> // 线程相关的
+#include <sys/types.h> // 包含许多应在适当时使用的基本派生类型
+#include <sys/stat.h> // 是unix/linux系统定义文件状态所在的伪标准头文件。
+#include <assert.h> // 断言，终端程序使用
+#include <dirent.h> // 主要用于文件系统的目录读取操作
+#include <fcntl.h> // 包含的相关函数有 open，fcntl，shutdown，unlink，fclose等
+#include <signal.h> // 信号量
+#include <sys/wait.h> // 进程控制
+#include <netdb.h> // 定义了与网络有关的结构，变量类型，宏，函数。
+#include <arpa/inet.h> // 定义sockaddr_in结构体
 
 using namespace std;
+
+// 创建线程池
+ThreadPool* pool = threadPoolCreate(3, 10, 100);
 
 #define HEADER_SIZE   10240L /* 请求头行的最大尺寸 */
 #define CGI_POST      10240L /* 读取POST数据到CGI的缓存区大小*/
 #define CGI_BUFFER    10240L /* 读取CGI输出的缓冲区大小 */
 #define FLAT_BUFFER   10240L /* 读取静态文件的缓冲区大小 */
 
-/*
- * Standard extensions
- */
-#define ENABLE_EXTENSIONS
-#ifdef  ENABLE_EXTENSIONS
+
 #define ENABLE_CGI      1    /* 是否启用CGI (also POST and HEAD) */
 #define ENABLE_DEFAULTS 1    /* 是否启用默认的index文件 (.php, .pl, .html) */
-#else
-#define ENABLE_CGI      0
-#define ENABLE_DEFAULTS 0
-#endif
-
 /*
 	例如，当浏览器输入127.0.0.1:8080时，默认index的执行限制
 */
 #define INDEX_DEFAULTS  { "index.htm", "index.html", 0}
 #define INDEX_EXECUTES  {         0,            0,  -1}
-
-
 // 当前服务器名称
 #define VERSION_STRING  "cgi/1.1"
-
 /*
-	传入的请求socket数据
+* 初始化存放请求容器的大小
 */
-struct socket_request {
-	int                fd;       /* Socket 本身 */
-	socklen_t          addr_len; /* 地址类型的长度 */
-	struct sockaddr_in address;  /* 远程 address */
-	pthread_t          thread;   /* 处理线程程序 */
-};
-
-/*
- * CGI 处理的数据
- */
-struct cgi_wait {
-	int                fd;       /* 读 */
-	int                fd2;      /* 写 */
-	int                pid;      /* 进程 ID */
-};
-
-// 服务器的socket
-int serversock;
-// 端口号
-int default_port;
-// 服务器默认静态文件存放的目录
-string default_root;
-
-// 最后一个断开连接的socket指针，需要free掉它
-void * _last_unaccepted;
-
-// 断开socket之后退出
-void handleShutdown(int sig) {
-	printf("\n[info] Shutting down.\n");
-
-	/*
-	 * Shutdown the socket.
-	 */
-	shutdown(serversock, SHUT_RDWR);
-	close(serversock);
-
-	/*
-	 * 释放线程数据块，用于下一个连接。
-	 */
-	free(_last_unaccepted);
-
-	/*
-	 * Exit.
-	 */
-	exit(sig);
-}
-
+#define INIT_VEC_SIZE 1024
 /*
  * 可变的 vector
  */
@@ -106,11 +49,48 @@ typedef struct {
 	unsigned int size;
 	unsigned int alloc_size;
 } vector_t;
-
 /*
-* 初始化大小
+	定义socket请求的结构体
+	传入的请求socket数据
 */
-#define INIT_VEC_SIZE 1024
+struct socket_request {
+	int                fd;       /* Socket 本身 */
+	socklen_t          addr_len; /* 地址类型的长度 */
+	struct sockaddr_in address;  /* 远程 address */
+	pthread_t          thread;   /* 处理线程程序 */
+};
+/*
+ * CGI 处理的数据的结构体
+ */
+struct cgi_wait {
+	int                fd;       /* 读 */
+	int                fd2;      /* 写 */
+	int                pid;      /* 进程 ID */
+};
+// 服务器的socket
+int serversock;
+// 端口号
+int default_port;
+// 服务器默认静态文件存放的目录
+string default_root;
+
+// 最后一个断开连接的socket指针，需要free掉它
+// void * _last_unaccepted;
+
+// 断开socket之后退出
+void handleShutdown(int sig) {
+	printf("\n[info] Shutting down.\n");
+	/*
+	 * Shutdown the socket.
+	 */
+	shutdown(serversock, SHUT_RDWR);
+	close(serversock);
+	/*
+	 * 释放线程数据块，用于下一个连接。
+	 */
+	// free(_last_unaccepted);
+	exit(sig);
+}
 
 /*
 * 初始化，动态分配内存
@@ -123,7 +103,6 @@ vector_t * alloc_vector(void) {
 
 	return v;
 }
-
 /*
 * 释放内存
 */
@@ -186,22 +165,19 @@ void generic_response(FILE * socket_stream, char * status, char * message) {
 void *wait_pid(void * onwhat) {
 	struct cgi_wait * cgi_w = (struct cgi_wait*)onwhat;
 	int status;
-
 	/*
 	 * 等待进程结束
 	 */
 	waitpid(cgi_w->pid, &status, 0);
-
 	/*
 	 * Close the respective pipe
 	 */
 	close(cgi_w->fd); // 读
 	close(cgi_w->fd2); // 写
-
 	/*
 	 * 释放掉已经发送了的数据
 	 */
-	free(onwhat);
+	// free(onwhat);
 	return NULL;
 }
 
@@ -210,7 +186,6 @@ void *wait_pid(void * onwhat) {
  */
 void *handleRequest(void *socket) {
 	struct socket_request * request = (struct socket_request *)socket;
-
 	/*
 	 * 将socket转换为标准的文件描述符
 	 */
@@ -221,32 +196,30 @@ void *handleRequest(void *socket) {
 		fprintf(stderr,"Ran out of a file descriptors, can not respond to request.\n");
 		goto _disconnect;
 	};
-
 	/*
 	 * 读请求，直到客户端关闭连接
 	 */
 	while (1) {
 		vector_t * queue = alloc_vector();
+		cerr << "开始读客户端发来的请求" << endl;
 		char buf[HEADER_SIZE];
 		while (!feof(socket_stream)) { // 文件结束：返回非0值；文件未结束：返回0值
 			/*
 			 * 当客户端还未断开连接时，将请求头读入队列中
 			 */
-			char * in = fgets( buf, HEADER_SIZE - 2, socket_stream );  // 从 socket_stream 流中读取 HEADER_SIZE - 2 个字符存储到字符数组 buf 所指向的内存空间。它的返回值是一个指针，指向字符串中第一个字符的地址。
-			if (!in) {
-				/*
-				 * EOF
-				 */
+			/*从 socket_stream 流中读取 HEADER_SIZE - 2 个字符存储到字符数组 buf 所指向的内存空间。
+			 它的返回值是一个指针，指向字符串中第一个字符的地址。
+			 */
+			char * in = fgets( buf, HEADER_SIZE - 2, socket_stream );  
+			if (!in) { // EOF
 				break;
 			}
-
 			if (!strcmp(in, "\r\n") || !strcmp(in,"\n")) { // strcmp相等返回0
 				/*
 				 * 到达头部末尾 .
 				 */
 				break;
 			}
-
 			if (!strstr(in, "\n")) {
 				/*
 				 * 超过请求行的大小
@@ -261,12 +234,12 @@ void *handleRequest(void *socket) {
 			// 在C++中void类型不能用来初始化char 类型的实体，但是C语言不强制转换void*不会报错。所以需要进行强制类型转换
 			char * request_line = (char *) malloc((strlen(buf)+1) * sizeof(char));
 			strcpy(request_line, buf);
-			vector_append(queue, (void*)request_line);
+			vector_append(queue, (void*)request_line); // 将请求行存储到vector中
 		}
 
 		if (feof(socket_stream)) { // 读取结束
 			/*
-			 * End of stream -> Client closed connection.
+			 * 读取结束，说明客户端关闭连接
 			 */
 			delete_vector(queue);
 			break;
@@ -275,10 +248,10 @@ void *handleRequest(void *socket) {
 		/*
 		 * 请求变量设置
 		 */
-		char * filename          = NULL; /* Filename as received (ie, /index.php) */
+		char * filename          = NULL; /* Filename as received (ie, /index.html) */
 		char * querystring       = NULL; /* Query string, URL encoded */
 		int request_type         = 0;    /* Request type, 0=GET, 1=POST, 2=HEAD ... */
-		char * _filename         = NULL; /* Filename relative to server (ie, pages/index.php) */
+		char * _filename         = NULL; /* Filename relative to server (ie, pages/index.html) */
 		char * ext               = NULL; /* Extension for requested file */
 		char * host              = NULL; /* Hostname for request, if supplied. */
 		char * http_version      = NULL; /* HTTP version used in request */
@@ -289,15 +262,16 @@ void *handleRequest(void *socket) {
 		char * c_referer         = NULL; /* Referer, for CGI */
 
 		/*
-		 * Process headers
+		 * 处理请求头
 		 */
 		unsigned int i = 0;
 		for (i = 0; i < queue->size; ++i) {
 			char * str = (char*)(vector_at(queue,i));
 			/*
-			 * Find the colon for a header
+			 * 在头部找冒号，除了第一行请求信息，都是key:value的形式
 			 */
-			char * colon = strstr(str,": "); // 返回值为char * 类型（ 返回指向 str1 中第一次出现的 str2 的指针）；如果 str2 不是 str1 的一部分，则返回空指针。
+			// 返回值为char * 类型（ 返回指向 str1 中第一次出现的 str2 的指针）；如果 str2 不是 str1 的一部分，则返回空指针。
+			char * colon = strstr(str,": "); 
 			if (!colon) {
 				if (i > 0) {
 					/*
@@ -307,7 +281,6 @@ void *handleRequest(void *socket) {
 					delete_vector(queue);
 					goto _disconnect;
 				}
-
 				/*
 				 * 请求方法类型
 				 */
@@ -315,7 +288,7 @@ void *handleRequest(void *socket) {
 				switch (str[0]) {
 					case 'G':
 						if (strstr(str, "GET ") == str) {
-							printf("get请求：%s", str);
+							// printf("get请求：%s", str);
 							r_type_width = 4;
 							request_type = 1;
 						} else {
@@ -328,7 +301,7 @@ void *handleRequest(void *socket) {
 							/*
 							 * POST: 发送数据给CGI
 							 */
-							printf("post请求：%s\n", str);
+							// printf("post请求：%s\n", str);
 							r_type_width = 5;
 							request_type = 2;
 						} else {
@@ -355,7 +328,8 @@ void *handleRequest(void *socket) {
 						break;
 				}
 
-				filename = str + r_type_width;
+				filename = str + r_type_width; // 定位到请求路径，例如：GET / HTTP/1.1，定位到的是'/'
+				// printf("filename:%s", filename);
 				if (filename[0] == ' ' || filename[0] == '\r' || filename[0] == '\n') {
 					/*
 					 * 请求缺少文件名，或者请求格式有误的情况
@@ -378,15 +352,6 @@ void *handleRequest(void *socket) {
 					goto _disconnect;
 				}
 				http_version[-1] = '\0';
-				char * tmp_newline;
-				tmp_newline = strstr(http_version, "\r\n");
-				if (tmp_newline) {
-					tmp_newline[0] = '\0';
-				}
-				tmp_newline = strstr(http_version, "\n");
-				if (tmp_newline) {
-					tmp_newline[0] = '\0';
-				}
 				
 				querystring = strstr(filename, "?"); // 用于获取get请求的参数
 				if (querystring) {
@@ -394,18 +359,18 @@ void *handleRequest(void *socket) {
 					querystring[-1] = '\0';
 				}
 			} else {
-
+				/**
+				 * 在正常的请求中，第一行一般是：GET / HTTP/1.1这样的形式
+				 * 如果第一行存在冒号，可以判断是非法请求
+				*/
 				if (i == 0) {
-					/*
-					 * 非法请求
-					 */
 					generic_response(socket_stream, (char *)"400 Bad Request", (char *)"Bad request: First line was not a request.");
 					delete_vector(queue);
 					goto _disconnect;
 				}
 
 				/*
-				 * 分离头部
+				 * 分离头部，取出key:value信息中的value
 				 */
 				colon[0] = '\0';
 				colon += 2;
@@ -424,7 +389,7 @@ void *handleRequest(void *socket) {
 				 * 处理 header
 				 * str: colon
 				 */
-				if (!strcmp(str, "Host")) {
+				if (!strcmp(str, "Host")) { // 相等返回0
 					/*
 					 * Host: The hostname of the (virtual) host the request was for.
 					 */
@@ -482,7 +447,7 @@ _unsupported:
 		}
 
 		/*
-		 * 在请求行中获取到了重要的信息，即_filename: 默认静态文件文件夹下的目录
+		 * 在请求行中获取到了重要的信息，即_filename: 默认静态文件文件夹下的目录或文件
 		 */
 		_filename = (char *) calloc(sizeof(char) * (strlen(default_root.c_str()) + strlen(filename) + 2), 1);
 		strcat(_filename, default_root.c_str());
@@ -520,11 +485,11 @@ _unsupported:
 		 */
 		struct stat stats;
 		if (stat(_filename, &stats) == 0 && S_ISDIR(stats.st_mode)) {
+			// printf("检查是否是目录_filename:%s", _filename);
 			if (_filename[strlen(_filename)-1] != '/') {
 				/*
 				 * 请求一个没有/结尾的目录
 				 * 抛出 'moved permanently' 并且重定向到客户端
-				 * to the directory /with/ the /.
 				 */
 				fprintf(socket_stream, "HTTP/1.1 301 Moved Permanently\r\n");
 				fprintf(socket_stream, "Server: " VERSION_STRING "\r\n");
@@ -590,7 +555,7 @@ _unsupported:
 				 */
 				char * listing = (char *) malloc(1024);
 				listing[0] = '\0';
-				strcat(listing, "<!doctype html><html><head><title>Directory Listing</title></head><body>");
+				strcat(listing, "<!doctype html><html><head><meta charset='UTF-8'><title>Directory Listing</title></head><body>");
 				int i = 0;
 				for (i = 0; i < filecount; ++i) {
 					/*
@@ -667,7 +632,6 @@ _use_file:
 					 * 关闭文件
 					 */
 					fclose(content);
-
 					/*
 					 * 准备管道
 					 */
@@ -692,8 +656,8 @@ _use_file:
 					if (_pid == 0) {
 						/*
 						 * 设置管道
-						 STDIN_FILENO：接收键盘的输入
-						 STDOUT_FILENO：向屏幕输出
+						   STDIN_FILENO：接收键盘的输入
+						   STDOUT_FILENO：向屏幕输出
 						 */
 						dup2(cgi_pipe_r[0],STDIN_FILENO);
 						dup2(cgi_pipe_w[1],STDOUT_FILENO);
@@ -718,7 +682,6 @@ _use_file:
 						strcat(docroot, temp.c_str());
 						// 将当前的工作目录改变成dir目录。
 						chdir(dir);
-						printf("测试pid=0:%s",host);
 						/*
 						 * 设置 CGI 环境变量
 						 * CONTENT_LENGTH    : The length of the query information. It's available only for POST requests.
@@ -743,6 +706,7 @@ _use_file:
 						 * SERVER_SOFTWARE   : Our application name and version
 						 */
 						/**
+						 * setenv (const char *__name, const char *__value, int __replace)
 						 * 参数：name为环境变量名称字符串。 value则为变量内容，overwrite用来决定是否要改变已存在的环境变量。
 						 * 如果overwrite不为0，而该环境变量原已有内容，则原内容会被改为参数value所指的变量内容。
 						 * 如果overwrite为0，且该环境变量已有内容，则参数value会被忽略。
@@ -819,6 +783,7 @@ _use_file:
 						char executable[1024];
 						executable[0] = '\0';
 						sprintf(executable, "./%s", _filename);
+						// printf("_filename@@@@：%s\n", _filename);
 						execlp(executable, executable, (char *)NULL);
 
 						/*
@@ -831,17 +796,17 @@ _use_file:
 						 */
 						delete_vector(queue);
 						free(dir);
-						free(_last_unaccepted);
-						pthread_detach(request->thread);
-						free(request);
+						// free(_last_unaccepted);
+						// pthread_detach(request->thread);
+						// free(request);
 
-						
+						sleep(1);
 						return NULL;
 					}
 
 					/*
 					 * 服务器线程
-					 * 当CGI应用程序完成执行时，打开一个线程来关闭管道的另一端。
+					 * 当CGI应用程序完成执行时，创建一个线程来关闭管道。
 					 */
 					struct cgi_wait * cgi_w = (cgi_wait *) malloc(sizeof(struct cgi_wait));
 					cgi_w->pid = _pid;
@@ -878,14 +843,14 @@ _use_file:
 							if (diff > CGI_POST) {
 								/*
 								 * 如果剩下的比缓冲的多，
-								 * 只读取缓冲区所需的数据。
+								 * 只读取缓冲区大小的数据。
 								 */
 								diff = CGI_POST;
 							}
 							size_t read;
 							read = fread(buf, 1, diff, socket_stream);
 							total_read += read;
-							printf("写post数据到cgi程序中：%s\n", buf);
+							// printf("写post数据到cgi程序中：%s\n", buf);
 							/*
 							 * 写到 CGI管道							 
 							 */
@@ -902,7 +867,7 @@ _use_file:
 					char buf[CGI_BUFFER];
 					if (!cgi_pipe) {
 						generic_response(socket_stream, (char *)"500 Internal Server Error", (char *)"Failed to execute CGI script.");
-						pthread_detach(_waitthread);
+						// pthread_detach(_waitthread);
 						goto _next;
 					}
 					fprintf(socket_stream, "HTTP/1.1 200 OK\r\n");
@@ -945,7 +910,7 @@ _use_file:
 						 * 如果是head请求，直接到这就可以
 						 */
 						fprintf(socket_stream, "\r\n");
-						pthread_detach(_waitthread);
+						// pthread_detach(_waitthread);
 						goto _next;
 					}
 
@@ -987,7 +952,6 @@ _use_file:
 							break;
 						}
 						if (enc_mode == 0) {
-							
 							fprintf(socket_stream, "\r\n%zX\r\n", read);
 						}
 						fwrite(buf, 1, read, socket_stream);
@@ -1002,7 +966,7 @@ _use_file:
 					/*
 					 * 释放等待的进程的内存
 					 */
-					pthread_detach(_waitthread);
+					// pthread_detach(_waitthread);
 					if (cgi_pipe) {
 						fclose(cgi_pipe);
 					}
@@ -1038,6 +1002,7 @@ _use_file:
 			/*
 			 * 判断文件的MIME类型
 			 */
+			// printf("ext:%s\n", ext);
 			if (ext) {
 				if (!strcmp(ext,".htm") || !strcmp(ext,".html")) {
 					fprintf(socket_stream, "Content-Type: text/html\r\n");
@@ -1068,7 +1033,6 @@ _use_file:
 				fclose(content);
 				goto _next;
 			}
-
 			/*
 			 * 响应长度
 			 */
@@ -1093,7 +1057,8 @@ _use_file:
 			}
 
 			fprintf(socket_stream, "\r\n");
-			
+			cerr << "结束了" << endl;
+			sleep(1);
 			fclose(content);
 		}
 
@@ -1104,6 +1069,7 @@ _next:
 		fflush(socket_stream);
 		free(_filename);
 		delete_vector(queue);
+		sleep(1);
 	}
 
 _disconnect:
@@ -1114,12 +1080,42 @@ _disconnect:
 	shutdown(request->fd, 2);
 
 	
-	if (request->thread) {
-		pthread_detach(request->thread); // 让线程分离 ---自动退出,无系统残留资源
-	}
-	free(request);
-
+	// if (request->thread) {
+	// 	pthread_detach(request->thread); // 让线程分离 ---自动退出,无系统残留资源
+	// }
+	// free(request);
+	sleep(1);
 	return NULL;
+}
+const int ips_len = 4;
+/**
+ * 添加ip地址的黑名单
+*/
+bool netIpIsValid(char * ip) {
+	long ret = inet_addr(ip);
+	string ip_black[ips_len] = {"127.0.0.1", "192.168.3.67", "192.168.3.68", "0.0.0.0"}; // 添加ip地址黑名单
+	if ((ret == 0) || (ret == 0xffffffff))  // 先判断ip地址输入是否正确合法
+	{
+		std::cout<< "访问的地址："<< ip << "不合法"<< std::endl; // 不合法的地址直接退出
+		
+		return false;
+	}else {
+		std::cout<< "访问的地址："<< ip << "合法" << std::endl; // 合法的地址进行下一步的黑名单的判断
+
+		for (int i = 0; i < ips_len; i++)
+		{
+			if (strstr(ip_black->c_str(), ip))
+			{
+				cout << "deny from " << ip << endl; 
+				return false;
+			}
+			
+			
+		}
+		cout << "allow from " << ip << endl; 
+		return true;
+	}
+	
 }
 
 void start_httpd(unsigned short port, string doc_root)
@@ -1132,7 +1128,7 @@ void start_httpd(unsigned short port, string doc_root)
 	 * 初始化socket参数
 	*/
 	struct sockaddr_in sin;
-	serversock = socket(AF_INET, SOCK_STREAM, 0);
+	serversock = socket(AF_INET, SOCK_STREAM, 0); // tcp
 	sin.sin_family      = AF_INET; // 协议族
 	sin.sin_port        = htons(port); // 端口号
 	sin.sin_addr.s_addr = INADDR_ANY; // 任意ip地址
@@ -1183,7 +1179,6 @@ void start_httpd(unsigned short port, string doc_root)
 	 * 若不想客户端退出可以把SIGPIPE设为SIG_IGN
 	 */
 	signal(SIGPIPE, SIG_IGN);
-
 	/*
 	 * 开始接收浏览器发出的连接请求
 	 */
@@ -1194,10 +1189,328 @@ void start_httpd(unsigned short port, string doc_root)
 		unsigned int c_len;
 		struct socket_request * incoming = (socket_request *) calloc(sizeof(struct socket_request),1);
 		c_len = sizeof(incoming->address);
-		_last_unaccepted = (void *)incoming;
+		// _last_unaccepted = (void *)incoming; // 将新的连接设置成最后一个断开的请求
 		incoming->fd = accept(serversock, (struct sockaddr *) &(incoming->address), &c_len);
-		_last_unaccepted = NULL;
-		pthread_create(&(incoming->thread), NULL, handleRequest, (void *)(incoming)); // 创建线程
+		struct sockaddr_in* ip = &(incoming->address);
+		struct in_addr ip_str = ip->sin_addr;
+		int ret = netIpIsValid(inet_ntoa(ip_str));
+		// _last_unaccepted = NULL;
+		if (!ret)
+		{
+			char buf[520]="HTTP/1.1 403 forbidden\r\nContent-Length: 100\r\nContent-Type: text/html; charset=utf-8\r\n\r\nerror message and the content should not be returned, nor should any metadata about the real file.";//HTTP响应
+            send(incoming->fd, buf, strlen(buf),0);
+			close(incoming->fd); // 关闭客户端资源
+			continue;
+		}
+		// pthread_create(&(incoming->thread), NULL, handleRequest, (void *)(incoming)); // 创建线程
+		threadPoolAdd(pool, (void (*)(void *))handleRequest, (void *)(incoming));
 	}
 
+	printf("**********");
+	sleep(30);
+
+	threadPoolDestroy(pool);
+
 }
+
+/**
+ * 以下方法实现线程池管理
+*/
+const int NUMBER = 2;
+// 任务结构体
+typedef struct Task
+{
+    void (*function)(void* arg);
+    void* arg;
+}Task;
+
+// 线程池结构体
+struct ThreadPool
+{
+    // 任务队列
+    Task* taskQ;
+    int queueCapacity;  // 容量
+    int queueSize;      // 当前任务个数
+    int queueFront;     // 队头 -> 取数据
+    int queueRear;      // 队尾 -> 放数据
+
+    pthread_t managerID;    // 管理者线程ID
+    pthread_t *threadIDs;   // 工作的线程ID
+    int minNum;             // 最小线程数量
+    int maxNum;             // 最大线程数量
+    int busyNum;            // 忙的线程的个数
+    int liveNum;            // 存活的线程的个数
+    int exitNum;            // 要销毁的线程个数
+    pthread_mutex_t mutexPool;  // 锁整个的线程池
+    pthread_mutex_t mutexBusy;  // 锁busyNum变量
+    pthread_cond_t notFull;     // 任务队列是不是满了
+    pthread_cond_t notEmpty;    // 任务队列是不是空了
+
+    int shutdown;           // 是不是要销毁线程池, 销毁为1, 不销毁为0
+};
+
+ThreadPool* threadPoolCreate(int min, int max, int queueSize)
+{
+    ThreadPool* pool = (ThreadPool*)malloc(sizeof(ThreadPool));
+    do 
+    {
+        if (pool == NULL)
+        {
+            printf("malloc threadpool fail...\n");
+            break;
+        }
+
+        pool->threadIDs = (pthread_t*)malloc(sizeof(pthread_t) * max);
+        if (pool->threadIDs == NULL)
+        {
+            printf("malloc threadIDs fail...\n");
+            break;
+        }
+        memset(pool->threadIDs, 0, sizeof(pthread_t) * max);
+        pool->minNum = min;
+        pool->maxNum = max;
+        pool->busyNum = 0;
+        pool->liveNum = min;    // 和最小个数相等
+        pool->exitNum = 0;
+
+        if (pthread_mutex_init(&pool->mutexPool, NULL) != 0 ||
+            pthread_mutex_init(&pool->mutexBusy, NULL) != 0 ||
+            pthread_cond_init(&pool->notEmpty, NULL) != 0 ||
+            pthread_cond_init(&pool->notFull, NULL) != 0)
+        {
+            printf("mutex or condition init fail...\n");
+            break;
+        }
+
+        // 任务队列
+        pool->taskQ = (Task*)malloc(sizeof(Task) * queueSize);
+        pool->queueCapacity = queueSize;
+        pool->queueSize = 0;
+        pool->queueFront = 0;
+        pool->queueRear = 0;
+
+        pool->shutdown = 0;
+
+        // 创建线程
+        pthread_create(&pool->managerID, NULL, manager, pool);
+        for (int i = 0; i < min; ++i)
+        {
+            pthread_create(&pool->threadIDs[i], NULL, worker, pool);
+        }
+        return pool;
+    } while (0);
+
+    // 释放资源
+    if (pool && pool->threadIDs) free(pool->threadIDs);
+    if (pool && pool->taskQ) free(pool->taskQ);
+    if (pool) free(pool);
+
+    return NULL;
+}
+
+int threadPoolDestroy(ThreadPool* pool)
+{
+    if (pool == NULL)
+    {
+        return -1;
+    }
+
+    // 关闭线程池
+    pool->shutdown = 1;
+    // 阻塞回收管理者线程
+    pthread_join(pool->managerID, NULL);
+    // 唤醒阻塞的消费者线程
+    for (int i = 0; i < pool->liveNum; ++i)
+    {
+        pthread_cond_signal(&pool->notEmpty);
+    }
+    // 释放堆内存
+    if (pool->taskQ)
+    {
+        free(pool->taskQ);
+    }
+    if (pool->threadIDs)
+    {
+        free(pool->threadIDs);
+    }
+
+    pthread_mutex_destroy(&pool->mutexPool);
+    pthread_mutex_destroy(&pool->mutexBusy);
+    pthread_cond_destroy(&pool->notEmpty);
+    pthread_cond_destroy(&pool->notFull);
+
+    free(pool);
+    pool = NULL;
+
+    return 0;
+}
+
+
+void threadPoolAdd(ThreadPool* pool, void(*func)(void*), void* arg)
+{
+    pthread_mutex_lock(&pool->mutexPool);
+    while (pool->queueSize == pool->queueCapacity && !pool->shutdown)
+    {
+        // 阻塞生产者线程
+        pthread_cond_wait(&pool->notFull, &pool->mutexPool);
+    }
+    if (pool->shutdown)
+    {
+        pthread_mutex_unlock(&pool->mutexPool);
+        return;
+    }
+    // 添加任务
+    pool->taskQ[pool->queueRear].function = func;
+    pool->taskQ[pool->queueRear].arg = arg;
+    pool->queueRear = (pool->queueRear + 1) % pool->queueCapacity;
+    pool->queueSize++;
+
+    pthread_cond_signal(&pool->notEmpty);
+    pthread_mutex_unlock(&pool->mutexPool);
+}
+
+int threadPoolBusyNum(ThreadPool* pool)
+{
+    pthread_mutex_lock(&pool->mutexBusy);
+    int busyNum = pool->busyNum;
+    pthread_mutex_unlock(&pool->mutexBusy);
+    return busyNum;
+}
+
+int threadPoolAliveNum(ThreadPool* pool)
+{
+    pthread_mutex_lock(&pool->mutexPool);
+    int aliveNum = pool->liveNum;
+    pthread_mutex_unlock(&pool->mutexPool);
+    return aliveNum;
+}
+
+void* worker(void* arg)
+{
+    ThreadPool* pool = (ThreadPool*)arg;
+
+    while (1)
+    {
+        pthread_mutex_lock(&pool->mutexPool);
+        // 当前任务队列是否为空
+        while (pool->queueSize == 0 && !pool->shutdown)
+        {
+            // 阻塞工作线程
+            pthread_cond_wait(&pool->notEmpty, &pool->mutexPool);
+
+            // 判断是不是要销毁线程
+            if (pool->exitNum > 0)
+            {
+                pool->exitNum--;
+                if (pool->liveNum > pool->minNum)
+                {
+                    pool->liveNum--;
+                    pthread_mutex_unlock(&pool->mutexPool);
+                    threadExit(pool);
+                }
+            }
+        }
+
+        // 判断线程池是否被关闭了
+        if (pool->shutdown)
+        {
+            pthread_mutex_unlock(&pool->mutexPool);
+            threadExit(pool);
+        }
+
+        // 从任务队列中取出一个任务
+        Task task;
+        task.function = pool->taskQ[pool->queueFront].function;
+        task.arg = pool->taskQ[pool->queueFront].arg;
+        // 移动头结点
+        pool->queueFront = (pool->queueFront + 1) % pool->queueCapacity;
+        pool->queueSize--;
+        // 解锁
+        pthread_cond_signal(&pool->notFull);
+        pthread_mutex_unlock(&pool->mutexPool);
+
+        printf("thread %ld start working...\n", pthread_self());
+        pthread_mutex_lock(&pool->mutexBusy);
+        pool->busyNum++;
+        pthread_mutex_unlock(&pool->mutexBusy);
+        task.function(task.arg);
+        free(task.arg);
+        task.arg = NULL;
+
+        printf("thread %ld end working...\n", pthread_self());
+        pthread_mutex_lock(&pool->mutexBusy);
+        pool->busyNum--;
+        pthread_mutex_unlock(&pool->mutexBusy);
+    }
+    return NULL;
+}
+
+void* manager(void* arg)
+{
+    ThreadPool* pool = (ThreadPool*)arg;
+    while (!pool->shutdown)
+    {
+        // 每隔3s检测一次
+        sleep(3);
+
+        // 取出线程池中任务的数量和当前线程的数量
+        pthread_mutex_lock(&pool->mutexPool);
+        int queueSize = pool->queueSize;
+        int liveNum = pool->liveNum;
+        pthread_mutex_unlock(&pool->mutexPool);
+
+        // 取出忙的线程的数量
+        pthread_mutex_lock(&pool->mutexBusy);
+        int busyNum = pool->busyNum;
+        pthread_mutex_unlock(&pool->mutexBusy);
+
+        // 添加线程
+        // 任务的个数>存活的线程个数 && 存活的线程数<最大线程数
+        if (queueSize > liveNum && liveNum < pool->maxNum)
+        {
+            pthread_mutex_lock(&pool->mutexPool);
+            int counter = 0;
+            for (int i = 0; i < pool->maxNum && counter < NUMBER
+                && pool->liveNum < pool->maxNum; ++i)
+            {
+                if (pool->threadIDs[i] == 0)
+                {
+                    pthread_create(&pool->threadIDs[i], NULL, worker, pool);
+                    counter++;
+                    pool->liveNum++;
+                }
+            }
+            pthread_mutex_unlock(&pool->mutexPool);
+        }
+        // 销毁线程
+        // 忙的线程*2 < 存活的线程数 && 存活的线程>最小线程数
+        if (busyNum * 2 < liveNum && liveNum > pool->minNum)
+        {
+            pthread_mutex_lock(&pool->mutexPool);
+            pool->exitNum = NUMBER;
+            pthread_mutex_unlock(&pool->mutexPool);
+            // 让工作的线程自杀
+            for (int i = 0; i < NUMBER; ++i)
+            {
+                pthread_cond_signal(&pool->notEmpty);
+            }
+        }
+    }
+    return NULL;
+}
+
+void threadExit(ThreadPool* pool)
+{
+    pthread_t tid = pthread_self();
+    for (int i = 0; i < pool->maxNum; ++i)
+    {
+        if (pool->threadIDs[i] == tid)
+        {
+            pool->threadIDs[i] = 0;
+            printf("threadExit() called, %ld exiting...\n", tid);
+            break;
+        }
+    }
+    pthread_exit(NULL);
+}
+

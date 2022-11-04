@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <limits.h>
 #include "httpd.h"
+#include <unistd.h>
 
 using namespace std;
 
@@ -13,11 +14,10 @@ void usage(char * argv0)
 
 int main(int argc, char *argv[])
 {
-	if (argc != 3) {
+	if (argc < 4) {
 		usage(argv[0]);
 		return 1;
 	}
-
 	long int port = strtol(argv[1], NULL, 10);
 
 	if (errno == EINVAL || errno == ERANGE) {
@@ -31,7 +31,7 @@ int main(int argc, char *argv[])
 	}
 
 	string doc_root = argv[2];
-
+	
 	start_httpd(port, doc_root);
 
 	return 0;
